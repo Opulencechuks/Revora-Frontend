@@ -73,6 +73,7 @@ function LineChartView({ data, currency }: { data: PerformanceDataPoint[]; curre
             cy={p.y}
             r={3}
             fill={lineColour}
+            role="img"
             aria-label={`${data[i].month}: ${formatCurrency(data[i].value, currency)}`}
           />
         ))}

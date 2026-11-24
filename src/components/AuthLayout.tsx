@@ -41,7 +41,7 @@ export const AuthLayout: React.FC<AuthLayoutProps> = ({
 
   return (
     <div className="auth-page-container">
-      <aside className="auth-marketing-panel animate-fade-in">
+      <div className="auth-marketing-panel animate-fade-in">
         <div className="auth-marketing-content">
           <h2 className="auth-marketing-title">
             Revora on <span className="text-primary">Stellar</span>
@@ -65,22 +65,22 @@ export const AuthLayout: React.FC<AuthLayoutProps> = ({
           </ul>
         </div>
         <div className="auth-marketing-glow"></div>
-      </aside>
+      </div>
 
-      <main role="main" aria-labelledby={titleId} className="auth-layout-outer animate-fade-in">
+      <section aria-labelledby={titleId} className="auth-layout-outer animate-fade-in">
         <div className="auth-card glass-card">
-          <header className="auth-header">
+          <div className="auth-header">
             <h1 id={titleId} className="auth-title">
               {title}
             </h1>
             {subtitle && <p className="auth-subtitle">{subtitle}</p>}
             {helperText && <p className="auth-helper">{helperText}</p>}
-          </header>
+          </div>
           <div className="auth-body">
             {children}
           </div>
         </div>
-      </main>
+      </section>
     </div>
   );
 };

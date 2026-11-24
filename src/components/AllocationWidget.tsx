@@ -75,6 +75,7 @@ function DonutChart({ slices }: { slices: AllocationSlice[] }) {
               strokeDasharray={`${seg.dashLen} ${circumference}`}
               strokeDashoffset={seg.offset}
               transform={`rotate(-90 ${cx} ${cy})`}
+              role="img"
               aria-label={`${seg.label}: ${seg.percentage.toFixed(1)}%`}
             />
           ))}

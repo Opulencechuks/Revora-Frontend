@@ -121,7 +121,7 @@ export const DashboardHero: React.FC<DashboardHeroProps> = ({
     const strokeColor = isPositive ? '#10b981' : '#ef4444'; // success or error colors
 
     return (
-      <div className="ml-4 hidden sm:block opacity-70" aria-label="Portfolio performance sparkline">
+      <div className="ml-4 hidden sm:block opacity-70" role="img" aria-label="Portfolio performance sparkline">
         <svg width={width} height={height} viewBox={`0 -5 ${width} ${height + 10}`} preserveAspectRatio="none">
           <polyline
             points={points}

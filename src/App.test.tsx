@@ -1,19 +1,85 @@
 import type { ReactElement } from "react";
-import { render, screen } from "@testing-library/react";
-import { createMemoryRouter, RouterProvider } from "react-router-dom";
+import { act, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { axe } from "jest-axe";
+import { createMemoryRouter, RouterProvider, type RouteObject } from "react-router-dom";
+import { vi } from "vitest";
+import { App, routes } from "./App";
+import { DensityProvider } from "./components/DensityProvider";
+import { RecentNetworksProvider } from "./components/RecentNetworksProvider";
 import { WalletConnectionProvider } from "./components/WalletConnection/WalletConnectionContext";
 
+vi.mock("@stellar/freighter-api", () => ({
+  isConnected: vi.fn(() => new Promise(() => {})),
+  requestAccess: vi.fn().mockResolvedValue({ address: "", error: undefined }),
+  getAddress: vi.fn().mockResolvedValue({ address: "", error: undefined }),
+  getNetworkDetails: vi.fn().mockResolvedValue({
+    network: "TESTNET",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    error: undefined,
+  }),
+}));
+
+vi.mock("./lib/soroban/revoraContract", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./lib/soroban/revoraContract")>();
+  return {
+    ...actual,
+    getContractSummary: vi.fn().mockResolvedValue({
+      periodCount: 3,
+      authorizedOfferingsCount: 2,
+    }),
+    getPeriodIds: vi.fn().mockResolvedValue([1, 2, 3]),
+    getPeriod: vi.fn().mockResolvedValue({
+      start_ledger: 100,
+      end_ledger: 200,
+      revenue_amount: 1000n,
+      is_complete: true,
+    }),
+    hasClaimed: vi.fn().mockResolvedValue(false),
+    getUnclaimedSummary: vi.fn().mockResolvedValue([]),
+    getAuthorizedOfferings: vi.fn().mockResolvedValue([]),
+  };
+});
+
 function withProviders(ui: ReactElement) {
-  return <WalletConnectionProvider>{ui}</WalletConnectionProvider>;
+  return (
+    <DensityProvider>
+      <RecentNetworksProvider>
+        <WalletConnectionProvider>{ui}</WalletConnectionProvider>
+      </RecentNetworksProvider>
+    </DensityProvider>
+  );
 }
 
 function renderAtPath(path: string) {
   const router = createMemoryRouter(routes, { initialEntries: [path] });
   return render(withProviders(<RouterProvider router={router} />));
 }
-import userEvent from '@testing-library/user-event';
-import { vi } from 'vitest';
-import { App, routes } from './App';
+
+function collectRoutePaths(routeList: RouteObject[], parentPath = ""): string[] {
+  const paths: string[] = [];
+  for (const route of routeList) {
+    let fullPath = parentPath;
+    if (route.path) {
+      if (route.path === "*") {
+        fullPath = "/__not-found-404__";
+      } else if (route.path.startsWith("/")) {
+        fullPath = route.path;
+      } else {
+        fullPath = `${parentPath.replace(/\/$/, "")}/${route.path}`;
+      }
+    }
+
+    if (route.children && route.children.length > 0) {
+      paths.push(...collectRoutePaths(route.children, fullPath));
+    } else if (fullPath) {
+      paths.push(fullPath);
+    }
+  }
+  return paths;
+}
+
+const allRoutePaths = collectRoutePaths(routes);
 
 describe('App Components Accessibility', () => {
   it('renders standard links and buttons correctly', () => {
@@ -154,4 +220,41 @@ describe('App Components Accessibility', () => {
     expect(investItem.tagName.toLowerCase()).toBe('li');
     expect(investItem.querySelector('a')).toBeNull();
   });
+});
+
+describe('Route Smoke & Accessibility', () => {
+  it.each(allRoutePaths)(
+    'renders route %s with landmarks, h1, no console errors, and no axe violations',
+    async (path) => {
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        let container!: HTMLElement;
+        await act(async () => {
+          ({ container } = renderAtPath(path));
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+
+        // Landmarks
+        expect(screen.getAllByRole('main')).toHaveLength(1);
+        expect(screen.getByRole('banner')).toBeInTheDocument();
+        expect(screen.getByRole('contentinfo')).toBeInTheDocument();
+        expect(screen.getByRole('navigation', { name: 'Primary' })).toBeInTheDocument();
+
+        // Exactly one top-level h1 heading per route
+        const h1s = screen.getAllByRole('heading', { level: 1 });
+        expect(h1s).toHaveLength(1);
+
+        // Color contrast is excluded because jsdom does not compute CSS styles/backgrounds reliably.
+        const axeResults = await axe(container, {
+          rules: {
+            'color-contrast': { enabled: false },
+          },
+        });
+        expect(axeResults).toHaveNoViolations();
+        expect(consoleErrorSpy).not.toHaveBeenCalled();
+      } finally {
+        consoleErrorSpy.mockRestore();
+      }
+    },
+  );
 });

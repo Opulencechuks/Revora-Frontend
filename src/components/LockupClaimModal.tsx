@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 
 import { AlertTriangle, ChevronRight, ExternalLink, Info, Sparkles, X } from 'lucide-react';
 import type { Transaction } from '@stellar/stellar-sdk';
 import { Button } from './Button';
+import { useFocusTrap } from '../hooks/useFocusTrap';
 import { useOptionalWalletConnection } from './WalletConnection/WalletConnectionContext';
 import { StatusTimeline, type Milestone, type MilestoneStatus } from './StatusTimeline/StatusTimeline';
 import { TransactionReceiptShare } from './StatusTimeline/TransactionReceiptShare';
@@ -56,8 +57,95 @@ interface TimelineFailure {
   reason: string;
 }
 
-const FOCUSABLE_SELECTOR =
-  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+type SorobanPhase =
+  | 'idle'
+  | 'simulating'
+  | 'simulated'
+  | 'signing'
+  | 'submitting'
+  | 'polling'
+  | 'confirmed'
+  | 'error';
+
+interface SimulationSummary {
+  preparedTransaction: Transaction;
+  estimatedFeeXlm: string;
+  estimatedFeeStroops: string;
+}
+
+interface TimelineFailure {
+  step: 'simulate' | 'sign' | 'submit' | 'confirm';
+  reason: string;
+}
+
+
+
+function buildSorobanMilestones(
+  phase: SorobanPhase,
+  failure: TimelineFailure | null,
+  pollAttempt: number,
+  estimatedFeeXlm?: string,
+): Milestone[] {
+  const resolveStatus = (
+    step: 'simulate' | 'sign' | 'submit' | 'confirm',
+    completedPhases: SorobanPhase[],
+    activePhases: SorobanPhase[],
+  ): MilestoneStatus => {
+    if (failure?.step === step) return 'blocked';
+    if (completedPhases.includes(phase)) return 'completed';
+    if (activePhases.includes(phase)) return 'in-progress';
+    return 'pending';
+  };
+
+  return [
+    {
+      id: 'simulate',
+      label: 'Simulate',
+      description:
+        failure?.step === 'simulate'
+          ? failure.reason
+          : estimatedFeeXlm
+            ? `Estimated fee: ${estimatedFeeXlm}`
+            : 'Verify contract call & fee',
+      status: resolveStatus(
+        'simulate',
+        ['simulated', 'signing', 'submitting', 'polling', 'confirmed'],
+        ['simulating'],
+      ),
+    },
+    {
+      id: 'sign',
+      label: 'Sign',
+      description:
+        failure?.step === 'sign'
+          ? failure.reason
+          : 'Approve in Freighter (Testnet)',
+      status: resolveStatus('sign', ['submitting', 'polling', 'confirmed'], ['signing']),
+    },
+    {
+      id: 'submit',
+      label: 'Submit',
+      description:
+        failure?.step === 'submit'
+          ? failure.reason
+          : 'Broadcast to Soroban RPC',
+      status: resolveStatus('submit', ['polling', 'confirmed'], ['submitting']),
+    },
+    {
+      id: 'confirm',
+      label: 'Confirm',
+      description:
+        failure?.step === 'confirm'
+          ? failure.reason
+          : phase === 'polling'
+            ? `Polling ledger (attempt ${Math.max(1, pollAttempt)})…`
+            : phase === 'confirmed'
+              ? 'Confirmed on Stellar Testnet'
+              : 'Await ledger finality',
+      status: resolveStatus('confirm', ['confirmed'], ['polling']),
+    },
+  ];
+}
 
 function buildSorobanMilestones(
   phase: SorobanPhase,
@@ -140,7 +228,6 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
 }) => {
   const wallet = useOptionalWalletConnection();
   const dialogRef = useRef<HTMLDivElement>(null);
-  const openerRef = useRef<HTMLElement | null>(null);
   const inFlightRef = useRef(false);
   const titleId = useId();
   const descriptionId = useId();
@@ -175,8 +262,7 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
 
   const handleClose = useCallback(() => {
     onClose();
-    restoreFocus();
-  }, [onClose, restoreFocus]);
+  }, [onClose]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -191,59 +277,21 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
       setPollAttempt(0);
       setConfirmedAt(null);
       inFlightRef.current = false;
-      return;
     }
+  }, [isOpen, initialAutoClaim]);
 
-    const activeElement = document.activeElement;
-    openerRef.current = activeElement instanceof HTMLElement ? activeElement : null;
+  // useFocusTrap handles initial focus, Tab trapping, and return-focus.
+  useFocusTrap(dialogRef, isOpen);
 
-    if (dialogRef.current) {
-      dialogRef.current.focus();
-    }
-
-    return () => {
-      restoreFocus();
-    };
-  }, [isOpen, initialAutoClaim, restoreFocus]);
-
+  // Escape key handling (useFocusTrap only traps Tab)
   useEffect(() => {
     if (!isOpen) return;
-
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault();
         handleClose();
-        return;
-      }
-
-      if (event.key === 'Tab' && dialogRef.current) {
-        const focusable = Array.from(
-          dialogRef.current.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
-        ).filter(
-          (el) => !el.hasAttribute('disabled') && el.getAttribute('aria-disabled') !== 'true',
-        );
-
-        if (focusable.length === 0) {
-          event.preventDefault();
-          dialogRef.current.focus();
-          return;
-        }
-
-        const active = document.activeElement as HTMLElement | null;
-        const currentIndex = active ? focusable.indexOf(active) : -1;
-
-        if (event.shiftKey) {
-          if (currentIndex <= 0) {
-            event.preventDefault();
-            focusable[focusable.length - 1].focus();
-          }
-        } else if (currentIndex === -1 || currentIndex === focusable.length - 1) {
-          event.preventDefault();
-          focusable[0].focus();
-        }
       }
     };
-
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, handleClose]);

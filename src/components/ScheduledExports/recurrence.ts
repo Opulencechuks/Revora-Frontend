@@ -37,68 +37,127 @@ function ordinalSuffix(n: number): string {
   }
 }
 
+const WEEKDAY_INDEX: Record<string, number> = {
+  Sun: 0,
+  Mon: 1,
+  Tue: 2,
+  Wed: 3,
+  Thu: 4,
+  Fri: 5,
+  Sat: 6,
+};
+
+interface LocalDateParts {
+  year: number;
+  month: number; // 1-12
+  day: number;
+  weekday: number; // 0 (Sun) - 6 (Sat)
+  hour: number; // 0-23
+  minute: number;
+  second: number;
+}
+
 /**
- * Returns the timezone offset (in ms) between UTC and `timezone` at the
- * given UTC `date`.  Positive means the target timezone is behind UTC.
+ * Extracts local calendar and wall-clock components for `date` in `timezone`
+ * using `Intl.DateTimeFormat`.
  */
-function getTzOffsetMs(date: Date, timezone: string): number {
+function getLocalDateParts(date: Date, timezone: string): LocalDateParts {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: timezone,
     year: 'numeric',
     month: 'numeric',
     day: 'numeric',
+    weekday: 'short',
     hour: 'numeric',
     minute: 'numeric',
     second: 'numeric',
-    hour12: false,
+    hourCycle: 'h23',
   }).formatToParts(date);
 
-  const getInt = (type: string): number =>
-    parseInt(parts.find((p) => p.type === type)?.value ?? '0', 10);
+  const get = (type: string): string =>
+    parts.find((p) => p.type === type)?.value ?? '0';
 
-  return (
-    Date.UTC(
-      getInt('year'),
-      getInt('month') - 1,
-      getInt('day'),
-      getInt('hour'),
-      getInt('minute'),
-      getInt('second'),
-    ) - date.getTime()
-  );
+  return {
+    year: parseInt(get('year'), 10),
+    month: parseInt(get('month'), 10),
+    day: parseInt(get('day'), 10),
+    weekday: WEEKDAY_INDEX[get('weekday')] ?? 0,
+    hour: parseInt(get('hour'), 10),
+    minute: parseInt(get('minute'), 10),
+    second: parseInt(get('second'), 10),
+  };
 }
 
 /**
- * Converts a local-time-in-timezone (expressed as Date.UTC components) to
- * the equivalent UTC `Date`, using the timezone offset at `refDate`.
- *
- * @param localComponents  Year, month (0-indexed), day, hours, minutes
- *                         expressing the desired *local* time in `timezone`.
- * @param timezone       IANA timezone string.
- * @param refDate        Date whose timezone offset is used for conversion.
+ * Returns the timezone offset (in ms) between `timezone` and UTC at `date`.
+ * Positive means the target timezone is ahead of UTC (e.g. UTC+13).
+ */
+function getTzOffsetMs(date: Date, timezone: string): number {
+  const { year, month, day, hour, minute, second } = getLocalDateParts(date, timezone);
+  const truncatedUtc = Math.floor(date.getTime() / 1000) * 1000;
+  return Date.UTC(year, month - 1, day, hour, minute, second) - truncatedUtc;
+}
+
+/**
+ * Adds `deltaDays` to a local calendar date `(year, month0, day)` and returns
+ * the normalized `[year, month0, day]` tuple.
+ */
+function addLocalDays(
+  year: number,
+  month0: number,
+  day: number,
+  deltaDays: number,
+): [number, number, number] {
+  const d = new Date(Date.UTC(year, month0, day + deltaDays));
+  return [d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()];
+}
+
+function daysInMonth(year: number, month0: number): number {
+  return new Date(Date.UTC(year, month0 + 1, 0)).getUTCDate();
+}
+
+/**
+ * Converts a local-time-in-timezone (expressed as `[year, month0, day, hours, minutes]`)
+ * to the equivalent UTC `Date`, resolving the timezone offset at the target local time
+ * so DST transitions preserve wall-clock time.
  */
 function localToUtc(
   localComponents: [number, number, number, number, number],
   timezone: string,
-  refDate: Date,
 ): Date {
   const [y, m, d, h, min] = localComponents;
   const localTs = Date.UTC(y, m, d, h, min, 0, 0);
-  return new Date(localTs - getTzOffsetMs(refDate, timezone));
+
+  const offset1 = getTzOffsetMs(new Date(localTs), timezone);
+  const utc1 = new Date(localTs - offset1);
+
+  const offset2 = getTzOffsetMs(utc1, timezone);
+  if (offset2 === offset1) {
+    return utc1;
+  }
+
+  const utc2 = new Date(localTs - offset2);
+  const check = getLocalDateParts(utc2, timezone);
+  if (check.hour === h && check.minute === min) {
+    return utc2;
+  }
+
+  // Spring-forward gap: the requested wall-clock time does not exist on this day.
+  return utc1;
 }
 
 /**
  * Computes the next run time for a recurring schedule.
  *
  * Algorithm:
- * 1. Resolve the current date in the target timezone via Intl.DateTimeFormat.
- * 2. For weekly / monthly schedules, FIRST snap to the correct day-of-week
- *    or day-of-month (clamped to month length).
- * 3. THEN check whether that time is still in the future; if not, advance
- *    by the appropriate period and snap again.
- *
- * The timezone offset is re-computed at each relevant date so DST transitions
- * (spring-forward / fall-back) are handled correctly.
+ * 1. Resolve the current local date and weekday in `rule.timezone` via `Intl.DateTimeFormat`.
+ * 2. For weekly / monthly schedules, snap the local calendar components to the target
+ *    weekday or day-of-month (clamped to the month's length).
+ * 3. Convert the snapped local date and wall-clock time to UTC using the timezone offset
+ *    at that target date.
+ * 4. If that instant is not in the future (`candidate <= now`), advance the local calendar
+ *    components by the recurrence period (1 day, 7 days, or 1 month with clamping) and
+ *    convert to UTC again so DST transitions preserve wall-clock time.
  *
  * @returns ISO-8601 string of the next occurrence.
  */
@@ -106,87 +165,76 @@ export function computeNextRun(rule: RecurrenceRule, after?: Date): string {
   const now = after ?? new Date();
   const [hours, minutes] = rule.time.split(':').map(Number);
 
-  // ── Step 1: Get the current date in the target timezone ─────────────
-  const tzParts = new Intl.DateTimeFormat('en-US', {
-    timeZone: rule.timezone,
-    year: 'numeric',
-    month: 'numeric',
-    day: 'numeric',
-    hour12: false,
-  }).formatToParts(now);
+  // ── Step 1: Get the current local date and weekday in the target timezone ──
+  const localNow = getLocalDateParts(now, rule.timezone);
+  let targetYear = localNow.year;
+  let targetMonth0 = localNow.month - 1;
+  let targetDay = localNow.day;
 
-  const getInt = (type: string): number =>
-    parseInt(tzParts.find((p) => p.type === type)?.value ?? '0', 10);
-
-  const tzYear = getInt('year');
-  const tzMonth = getInt('month');
-  const tzDay = getInt('day');
-
-  // ── Step 2: Build initial candidate ─────────────────────────────────
-  let candidate = localToUtc(
-    [tzYear, tzMonth - 1, tzDay, hours, minutes],
-    rule.timezone,
-    now,
-  );
-
-  // ── Step 3: Snap to the correct day-of-week / day-of-month ──────────
+  // ── Step 2: Snap local calendar components to target weekday / day-of-month ─
   if (rule.frequency === 'weekly' && rule.dayOfWeek !== undefined) {
-    const targetDay = rule.dayOfWeek;
-    let currentDay = candidate.getUTCDay();
-    let diff = targetDay - currentDay;
+    let diff = rule.dayOfWeek - localNow.weekday;
     if (diff < 0) diff += 7;
     if (diff > 0) {
-      candidate = new Date(candidate.getTime() + diff * 24 * 60 * 60 * 1000);
+      [targetYear, targetMonth0, targetDay] = addLocalDays(
+        targetYear,
+        targetMonth0,
+        targetDay,
+        diff,
+      );
     }
   }
 
   if (rule.frequency === 'monthly' && rule.dayOfMonth !== undefined) {
-    const cY = candidate.getUTCFullYear();
-    const cM = candidate.getUTCMonth();
-    const lastDay = new Date(Date.UTC(cY, cM + 1, 0)).getUTCDate();
-    const clampedDay = Math.min(rule.dayOfMonth, lastDay);
-    const dayDiff = clampedDay - candidate.getUTCDate();
-    if (dayDiff !== 0) {
-      candidate = new Date(candidate.getTime() + dayDiff * 24 * 60 * 60 * 1000);
-    }
+    targetDay = Math.min(rule.dayOfMonth, daysInMonth(targetYear, targetMonth0));
   }
 
-  // ── Step 4: If candidate is in the past, advance ────────────────────
+  // ── Step 3: Convert snapped local date/time to UTC ──────────────────────────
+  let candidate = localToUtc(
+    [targetYear, targetMonth0, targetDay, hours, minutes],
+    rule.timezone,
+  );
+
+  // ── Step 4: If candidate is in the past, advance local date and reconvert ───
   if (candidate <= now) {
     switch (rule.frequency) {
-      case 'daily':
-        candidate = new Date(candidate.getTime() + 24 * 60 * 60 * 1000);
+      case 'daily': {
+        [targetYear, targetMonth0, targetDay] = addLocalDays(
+          targetYear,
+          targetMonth0,
+          targetDay,
+          1,
+        );
+        candidate = localToUtc(
+          [targetYear, targetMonth0, targetDay, hours, minutes],
+          rule.timezone,
+        );
         break;
+      }
 
       case 'weekly': {
-        candidate = new Date(candidate.getTime() + 7 * 24 * 60 * 60 * 1000);
-        const targetDay = rule.dayOfWeek!;
-        let currentDay = candidate.getUTCDay();
-        let diff = targetDay - currentDay;
-        if (diff < 0) diff += 7;
-        if (diff > 0) {
-          candidate = new Date(candidate.getTime() + diff * 24 * 60 * 60 * 1000);
-        }
+        [targetYear, targetMonth0, targetDay] = addLocalDays(
+          targetYear,
+          targetMonth0,
+          targetDay,
+          7,
+        );
+        candidate = localToUtc(
+          [targetYear, targetMonth0, targetDay, hours, minutes],
+          rule.timezone,
+        );
         break;
       }
 
       case 'monthly': {
-        // Advance the month, then reconstruct using the rule's local
-        // time and the timezone offset at the advanced date.  This
-        // handles DST transitions correctly (e.g. EST → EDT).
-        const cY = candidate.getUTCFullYear();
-        const cM = candidate.getUTCMonth();
-        const nextMonth = cM + 1;
-        const nextYear = nextMonth > 11 ? cY + 1 : cY;
-        const nextMonthIdx = nextMonth > 11 ? 0 : nextMonth;
+        const nextMonth = targetMonth0 + 1;
+        const nextYear = nextMonth > 11 ? targetYear + 1 : targetYear;
+        const nextMonth0 = nextMonth > 11 ? 0 : nextMonth;
         const tDay = rule.dayOfMonth ?? 1;
-        const lastDay = new Date(Date.UTC(nextYear, nextMonthIdx + 1, 0)).getUTCDate();
-        const clampedDay = Math.min(tDay, lastDay);
-        // Use the rule's local hours+minutes with the future date's offset.
+        const clampedDay = Math.min(tDay, daysInMonth(nextYear, nextMonth0));
         candidate = localToUtc(
-          [nextYear, nextMonthIdx, clampedDay, hours, minutes],
+          [nextYear, nextMonth0, clampedDay, hours, minutes],
           rule.timezone,
-          new Date(Date.UTC(nextYear, nextMonthIdx, clampedDay, 12, 0, 0, 0)),
         );
         break;
       }

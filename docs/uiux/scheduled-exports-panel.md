@@ -68,11 +68,11 @@ Responsive table listing all scheduled exports with columns: Name, Status, Sched
 | `defaultRecurrenceRule()` | Daily at 09:00 UTC |
 
 **`computeNextRun` algorithm:**
-1. Resolve current date in the target timezone via `Intl.DateTimeFormat`
-2. Build initial candidate at today's scheduled time  
-3. For weekly/monthly schedules, snap to the correct day-of-week / day-of-month *before* advancing  
-4. If the snapped time is in the past, advance by the recurrence period  
-5. The timezone offset is recomputed at each relevant date so DST transitions are handled correctly (EST→EDT, etc.)
+1. Resolve the current local date and weekday in `rule.timezone` via `Intl.DateTimeFormat`
+2. For weekly/monthly schedules, snap the local calendar components to the target weekday or day-of-month (clamped to month length) *before* converting to UTC
+3. Convert the local date and wall-clock time to UTC using the timezone offset at the target date
+4. If the candidate is in the past, advance the local calendar components (1 day, 7 days, or 1 month with clamping) and convert to UTC again
+5. Because day/month arithmetic is performed on local calendar components and converted via the target date's offset, DST transitions preserve wall-clock time and non-UTC zones (e.g. `Pacific/Auckland`, `America/Los_Angeles`) never drift a day near midnight
 
 ---
 
@@ -159,7 +159,7 @@ The table wrapper uses `overflow-x: auto` with `-webkit-overflow-scrolling: touc
 
 | File | Tests | Notes |
 |---|---|---|
-| `recurrence.test.ts` | 44 | `computeNextRun`, `describeSchedule`, `formatTime`, validation |
+| `recurrence.test.ts` | 56 | `computeNextRun`, `describeSchedule`, `formatTime`, validation |
 | `RecurrenceEditor.test.tsx` | 13 | Render, interaction, accessibility (axe) |
 | `ScheduleFormDialog.test.tsx` | 13 | Open/close, validation, save, accessibility |
 | `SchedulesTable.test.tsx` | 16 | Render, action menu, empty state, accessibility |

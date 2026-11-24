@@ -381,6 +381,304 @@ describe('computeNextRun', () => {
     expect(d.getUTCHours()).toBe(0);
     expect(d.getUTCMinutes()).toBe(0);
   });
+
+  /* ── Non-UTC weekly/monthly snapping & DST wall-clock preservation ──── */
+
+  const WEEKDAY_MAP: Record<string, number> = {
+    Sun: 0,
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6,
+  };
+
+  function getLocalParts(isoString: string, timeZone: string) {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      weekday: 'short',
+      hour: 'numeric',
+      minute: 'numeric',
+      hourCycle: 'h23',
+    }).formatToParts(new Date(isoString));
+    const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '';
+    return {
+      year: parseInt(get('year'), 10),
+      month: parseInt(get('month'), 10),
+      day: parseInt(get('day'), 10),
+      weekday: WEEKDAY_MAP[get('weekday')],
+      hour: parseInt(get('hour'), 10),
+      minute: parseInt(get('minute'), 10),
+    };
+  }
+
+  it('snaps weekly schedule to local weekday in Pacific/Auckland (UTC+13) near midnight', () => {
+    // 2026-01-11T11:30:00Z = Monday Jan 12, 2026 00:30 NZDT (UTC+13)
+    const base = new Date('2026-01-11T11:30:00Z');
+    const rule: RecurrenceRule = {
+      frequency: 'weekly',
+      time: '01:00',
+      timezone: 'Pacific/Auckland',
+      dayOfWeek: 1, // Monday
+    };
+    const result = computeNextRun(rule, base);
+    expect(result).toBe('2026-01-11T12:00:00.000Z');
+    expect(getLocalParts(result, 'Pacific/Auckland')).toEqual({
+      year: 2026,
+      month: 1,
+      day: 12,
+      weekday: 1,
+      hour: 1,
+      minute: 0,
+    });
+  });
+
+  it('advances weekly schedule by 7 local days in Pacific/Auckland (UTC+13) when time passed', () => {
+    // 2026-01-11T12:30:00Z = Monday Jan 12, 2026 01:30 NZDT (UTC+13)
+    const base = new Date('2026-01-11T12:30:00Z');
+    const rule: RecurrenceRule = {
+      frequency: 'weekly',
+      time: '01:00',
+      timezone: 'Pacific/Auckland',
+      dayOfWeek: 1, // Monday
+    };
+    const result = computeNextRun(rule, base);
+    expect(result).toBe('2026-01-18T12:00:00.000Z');
+    expect(getLocalParts(result, 'Pacific/Auckland')).toEqual({
+      year: 2026,
+      month: 1,
+      day: 19,
+      weekday: 1,
+      hour: 1,
+      minute: 0,
+    });
+  });
+
+  it('snaps weekly schedule to local weekday in America/Los_Angeles (UTC-8) near midnight', () => {
+    // 2026-01-13T05:30:00Z = Monday Jan 12, 2026 21:30 PST (UTC-8)
+    const base = new Date('2026-01-13T05:30:00Z');
+    const rule: RecurrenceRule = {
+      frequency: 'weekly',
+      time: '22:00',
+      timezone: 'America/Los_Angeles',
+      dayOfWeek: 1, // Monday
+    };
+    const result = computeNextRun(rule, base);
+    expect(result).toBe('2026-01-13T06:00:00.000Z');
+    expect(getLocalParts(result, 'America/Los_Angeles')).toEqual({
+      year: 2026,
+      month: 1,
+      day: 12,
+      weekday: 1,
+      hour: 22,
+      minute: 0,
+    });
+  });
+
+  it('advances weekly schedule by 7 local days in America/Los_Angeles (UTC-8) when time passed', () => {
+    // 2026-01-13T06:30:00Z = Monday Jan 12, 2026 22:30 PST (UTC-8)
+    const base = new Date('2026-01-13T06:30:00Z');
+    const rule: RecurrenceRule = {
+      frequency: 'weekly',
+      time: '22:00',
+      timezone: 'America/Los_Angeles',
+      dayOfWeek: 1, // Monday
+    };
+    const result = computeNextRun(rule, base);
+    expect(result).toBe('2026-01-20T06:00:00.000Z');
+    expect(getLocalParts(result, 'America/Los_Angeles')).toEqual({
+      year: 2026,
+      month: 1,
+      day: 19,
+      weekday: 1,
+      hour: 22,
+      minute: 0,
+    });
+  });
+
+  it('snaps monthly schedule in Pacific/Auckland (UTC+13) when local month is ahead of UTC', () => {
+    // 2026-02-28T11:30:00Z = March 1, 2026 00:30 NZDT (UTC+13)
+    const base = new Date('2026-02-28T11:30:00Z');
+    const rule: RecurrenceRule = {
+      frequency: 'monthly',
+      time: '01:00',
+      timezone: 'Pacific/Auckland',
+      dayOfMonth: 1,
+    };
+    const result = computeNextRun(rule, base);
+    expect(result).toBe('2026-02-28T12:00:00.000Z');
+    expect(getLocalParts(result, 'Pacific/Auckland')).toEqual({
+      year: 2026,
+      month: 3,
+      day: 1,
+      weekday: 0,
+      hour: 1,
+      minute: 0,
+    });
+  });
+
+  it('clamps monthly 31st to Feb 28 in Pacific/Auckland (UTC+13) near midnight', () => {
+    // 2026-01-30T12:30:00Z = Jan 31, 2026 01:30 NZDT (UTC+13)
+    const base = new Date('2026-01-30T12:30:00Z');
+    const rule: RecurrenceRule = {
+      frequency: 'monthly',
+      time: '01:00',
+      timezone: 'Pacific/Auckland',
+      dayOfMonth: 31,
+    };
+    const result = computeNextRun(rule, base);
+    expect(result).toBe('2026-02-27T12:00:00.000Z');
+    expect(getLocalParts(result, 'Pacific/Auckland')).toEqual({
+      year: 2026,
+      month: 2,
+      day: 28,
+      weekday: 6,
+      hour: 1,
+      minute: 0,
+    });
+  });
+
+  it('clamps monthly 31st to Feb 28 in America/Los_Angeles (UTC-8) near midnight', () => {
+    // 2026-02-01T06:30:00Z = Jan 31, 2026 22:30 PST (UTC-8)
+    const base = new Date('2026-02-01T06:30:00Z');
+    const rule: RecurrenceRule = {
+      frequency: 'monthly',
+      time: '22:00',
+      timezone: 'America/Los_Angeles',
+      dayOfMonth: 31,
+    };
+    const result = computeNextRun(rule, base);
+    expect(result).toBe('2026-03-01T06:00:00.000Z');
+    expect(getLocalParts(result, 'America/Los_Angeles')).toEqual({
+      year: 2026,
+      month: 2,
+      day: 28,
+      weekday: 6,
+      hour: 22,
+      minute: 0,
+    });
+  });
+
+  it('keeps wall-clock time for daily schedule across spring-forward DST', () => {
+    // Mar 7 2026 10:00 EST -> next run Mar 8 2026 09:00 EDT (UTC-4 = 13:00Z)
+    const base = new Date('2026-03-07T15:00:00Z');
+    const rule: RecurrenceRule = {
+      frequency: 'daily',
+      time: '09:00',
+      timezone: 'America/New_York',
+    };
+    const result = computeNextRun(rule, base);
+    expect(result).toBe('2026-03-08T13:00:00.000Z');
+    expect(getLocalParts(result, 'America/New_York')).toMatchObject({
+      year: 2026,
+      month: 3,
+      day: 8,
+      hour: 9,
+      minute: 0,
+    });
+  });
+
+  it('keeps wall-clock time for daily schedule across fall-back DST', () => {
+    // Oct 31 2026 10:00 EDT -> next run Nov 1 2026 09:00 EST (UTC-5 = 14:00Z)
+    const base = new Date('2026-10-31T14:00:00Z');
+    const rule: RecurrenceRule = {
+      frequency: 'daily',
+      time: '09:00',
+      timezone: 'America/New_York',
+    };
+    const result = computeNextRun(rule, base);
+    expect(result).toBe('2026-11-01T14:00:00.000Z');
+    expect(getLocalParts(result, 'America/New_York')).toMatchObject({
+      year: 2026,
+      month: 11,
+      day: 1,
+      hour: 9,
+      minute: 0,
+    });
+  });
+
+  it('keeps wall-clock time for weekly schedule across spring-forward DST', () => {
+    // Mon Mar 2 2026 10:00 PST -> next run Mon Mar 9 2026 09:00 PDT (UTC-7 = 16:00Z)
+    const base = new Date('2026-03-02T18:00:00Z');
+    const rule: RecurrenceRule = {
+      frequency: 'weekly',
+      time: '09:00',
+      timezone: 'America/Los_Angeles',
+      dayOfWeek: 1,
+    };
+    const result = computeNextRun(rule, base);
+    expect(result).toBe('2026-03-09T16:00:00.000Z');
+    expect(getLocalParts(result, 'America/Los_Angeles')).toMatchObject({
+      year: 2026,
+      month: 3,
+      day: 9,
+      weekday: 1,
+      hour: 9,
+      minute: 0,
+    });
+  });
+
+  it('keeps wall-clock time for weekly schedule across southern-hemisphere fall-back DST', () => {
+    // Mon Mar 30 2026 13:00 NZDT -> NZ DST ends Apr 5 -> Mon Apr 6 2026 09:00 NZST (UTC+12 = Apr 5 21:00Z)
+    const base = new Date('2026-03-30T00:00:00Z');
+    const rule: RecurrenceRule = {
+      frequency: 'weekly',
+      time: '09:00',
+      timezone: 'Pacific/Auckland',
+      dayOfWeek: 1,
+    };
+    const result = computeNextRun(rule, base);
+    expect(result).toBe('2026-04-05T21:00:00.000Z');
+    expect(getLocalParts(result, 'Pacific/Auckland')).toMatchObject({
+      year: 2026,
+      month: 4,
+      day: 6,
+      weekday: 1,
+      hour: 9,
+      minute: 0,
+    });
+  });
+
+  it('matches local weekday and wall-clock time across many timezones near midnight', () => {
+    const zones = [
+      'UTC',
+      'Pacific/Honolulu',
+      'America/Los_Angeles',
+      'America/New_York',
+      'America/Sao_Paulo',
+      'Europe/London',
+      'Europe/Berlin',
+      'Asia/Kolkata',
+      'Asia/Tokyo',
+      'Australia/Sydney',
+      'Pacific/Auckland',
+    ];
+    const base = new Date('2026-01-15T12:00:00Z');
+
+    for (const timezone of zones) {
+      for (const time of ['00:30', '23:30']) {
+        const [expectedHour, expectedMinute] = time.split(':').map(Number);
+        for (let dayOfWeek = 0; dayOfWeek <= 6; dayOfWeek++) {
+          const rule: RecurrenceRule = {
+            frequency: 'weekly',
+            time,
+            timezone,
+            dayOfWeek,
+          };
+          const result = computeNextRun(rule, base);
+          expect(new Date(result).getTime()).toBeGreaterThan(base.getTime());
+          const local = getLocalParts(result, timezone);
+          expect(local.weekday).toBe(dayOfWeek);
+          expect(local.hour).toBe(expectedHour);
+          expect(local.minute).toBe(expectedMinute);
+        }
+      }
+    }
+  });
 });
 
 describe('defaultRecurrenceRule', () => {

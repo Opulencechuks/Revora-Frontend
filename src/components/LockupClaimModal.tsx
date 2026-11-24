@@ -1,6 +1,20 @@
-import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, ChevronRight, ExternalLink, Info, Sparkles, X } from 'lucide-react';
+import type { Transaction } from '@stellar/stellar-sdk';
 import { Button } from './Button';
+import { useOptionalWalletConnection } from './WalletConnection/WalletConnectionContext';
+import { StatusTimeline, type Milestone, type MilestoneStatus } from './StatusTimeline/StatusTimeline';
+import { TransactionReceiptShare } from './StatusTimeline/TransactionReceiptShare';
+import { CONTRACT_ID, buildTransactionExplorerUrl } from '../constants/stellar';
+import {
+  ClaimTransactionError,
+  buildClaimTransaction,
+  isTestnetNetworkPassphrase,
+  signClaimTransaction,
+  simulateClaimTransaction,
+  submitAndPollClaimTransaction,
+  type ClaimPollUpdate,
+} from '../lib/soroban/claimTransaction';
 
 export interface LockupClaimResult {
   hash?: string;
@@ -14,10 +28,103 @@ export interface LockupClaimModalProps {
   initialAutoClaim?: boolean;
   onClaim?: (options: { autoClaim: boolean }) => Promise<LockupClaimResult | void>;
   explorerBaseUrl?: string;
+  /** Distribution period ID for Soroban claim transactions (defaults to 1). */
+  periodId?: number;
+  /** Optional polling overrides (primarily for testing). */
+  pollIntervalMs?: number;
+  maxPollAttempts?: number;
+}
+
+type SorobanPhase =
+  | 'idle'
+  | 'simulating'
+  | 'simulated'
+  | 'signing'
+  | 'submitting'
+  | 'polling'
+  | 'confirmed'
+  | 'error';
+
+interface SimulationSummary {
+  preparedTransaction: Transaction;
+  estimatedFeeXlm: string;
+  estimatedFeeStroops: string;
+}
+
+interface TimelineFailure {
+  step: 'simulate' | 'sign' | 'submit' | 'confirm';
+  reason: string;
 }
 
 const FOCUSABLE_SELECTOR =
   'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function buildSorobanMilestones(
+  phase: SorobanPhase,
+  failure: TimelineFailure | null,
+  pollAttempt: number,
+  estimatedFeeXlm?: string,
+): Milestone[] {
+  const resolveStatus = (
+    step: 'simulate' | 'sign' | 'submit' | 'confirm',
+    completedPhases: SorobanPhase[],
+    activePhases: SorobanPhase[],
+  ): MilestoneStatus => {
+    if (failure?.step === step) return 'blocked';
+    if (completedPhases.includes(phase)) return 'completed';
+    if (activePhases.includes(phase)) return 'in-progress';
+    return 'pending';
+  };
+
+  return [
+    {
+      id: 'simulate',
+      label: 'Simulate',
+      description:
+        failure?.step === 'simulate'
+          ? failure.reason
+          : estimatedFeeXlm
+            ? `Estimated fee: ${estimatedFeeXlm}`
+            : 'Verify contract call & fee',
+      status: resolveStatus(
+        'simulate',
+        ['simulated', 'signing', 'submitting', 'polling', 'confirmed'],
+        ['simulating'],
+      ),
+    },
+    {
+      id: 'sign',
+      label: 'Sign',
+      description:
+        failure?.step === 'sign'
+          ? failure.reason
+          : 'Approve in Freighter (Testnet)',
+      status: resolveStatus('sign', ['submitting', 'polling', 'confirmed'], ['signing']),
+    },
+    {
+      id: 'submit',
+      label: 'Submit',
+      description:
+        failure?.step === 'submit'
+          ? failure.reason
+          : 'Broadcast to Soroban RPC',
+      status: resolveStatus('submit', ['polling', 'confirmed'], ['submitting']),
+    },
+    {
+      id: 'confirm',
+      label: 'Confirm',
+      description:
+        failure?.step === 'confirm'
+          ? failure.reason
+          : phase === 'polling'
+            ? `Polling ledger (attempt ${Math.max(1, pollAttempt)})…`
+            : phase === 'confirmed'
+              ? 'Confirmed on Stellar Testnet'
+              : 'Await ledger finality',
+      status: resolveStatus('confirm', ['confirmed'], ['polling']),
+    },
+  ];
+}
 
 export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
   isOpen,
@@ -27,7 +134,11 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
   initialAutoClaim = false,
   onClaim,
   explorerBaseUrl = 'https://stellar.expert/explorer/public/tx/',
+  periodId = 1,
+  pollIntervalMs,
+  maxPollAttempts,
 }) => {
+  const wallet = useOptionalWalletConnection();
   const dialogRef = useRef<HTMLDivElement>(null);
   const openerRef = useRef<HTMLElement | null>(null);
   const inFlightRef = useRef(false);
@@ -41,6 +152,19 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
   const [txHash, setTxHash] = useState<string | null>(null);
   const [highGasConfirmed, setHighGasConfirmed] = useState(false);
   const [showAutoClaimInfo, setShowAutoClaimInfo] = useState(false);
+
+  // Soroban testnet flow state
+  const [sorobanPhase, setSorobanPhase] = useState<SorobanPhase>('idle');
+  const [simulationInfo, setSimulationInfo] = useState<SimulationSummary | null>(null);
+  const [timelineFailure, setTimelineFailure] = useState<TimelineFailure | null>(null);
+  const [pollAttempt, setPollAttempt] = useState(0);
+  const [confirmedAt, setConfirmedAt] = useState<string | null>(null);
+
+  const hasWalletContext = wallet !== null;
+  const isWalletConnected = wallet?.status === 'connected' && Boolean(wallet.address);
+  const isTestnet = isTestnetNetworkPassphrase(wallet?.networkPassphrase);
+  const isNetworkMismatch = isWalletConnected && !isTestnet;
+  const useSorobanFlow = !onClaim && hasWalletContext;
 
   const restoreFocus = useCallback(() => {
     const opener = openerRef.current;
@@ -61,6 +185,11 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
       setStatusMessage('');
       setTxHash(null);
       setHighGasConfirmed(false);
+      setSorobanPhase('idle');
+      setSimulationInfo(null);
+      setTimelineFailure(null);
+      setPollAttempt(0);
+      setConfirmedAt(null);
       inFlightRef.current = false;
       return;
     }
@@ -119,7 +248,160 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, handleClose]);
 
+  const milestones = useMemo(
+    () =>
+      buildSorobanMilestones(
+        sorobanPhase,
+        timelineFailure,
+        pollAttempt,
+        simulationInfo?.estimatedFeeXlm,
+      ),
+    [sorobanPhase, timelineFailure, pollAttempt, simulationInfo?.estimatedFeeXlm],
+  );
+
   if (!isOpen) return null;
+
+  const handleSorobanSimulate = async () => {
+    if (!wallet || !wallet.address || !isTestnet) {
+      setClaimState('error');
+      setStatusMessage(
+        isNetworkMismatch
+          ? 'Signing refused: switch Freighter to Stellar Testnet to claim.'
+          : 'Connect a Freighter wallet on Stellar Testnet to claim on-chain.',
+      );
+      return;
+    }
+
+    inFlightRef.current = true;
+    setClaimState('pending');
+    setSorobanPhase('simulating');
+    setTimelineFailure(null);
+    setSimulationInfo(null);
+    setTxHash(null);
+    setStatusMessage('Simulating claim transaction on Stellar Testnet…');
+
+    try {
+      const tx = await buildClaimTransaction(wallet.address, periodId);
+      const sim = await simulateClaimTransaction(tx);
+
+      if (!sim.ok) {
+        setSorobanPhase('error');
+        setClaimState('error');
+        setTimelineFailure({ step: 'simulate', reason: sim.error });
+        setStatusMessage(`Simulation failed: ${sim.error}`);
+        return;
+      }
+
+      setSimulationInfo({
+        preparedTransaction: sim.preparedTransaction,
+        estimatedFeeXlm: sim.estimatedFeeXlm,
+        estimatedFeeStroops: sim.estimatedFeeStroops,
+      });
+      setSorobanPhase('simulated');
+      setClaimState('idle');
+      setStatusMessage(
+        `Simulation succeeded. Estimated network fee: ${sim.estimatedFeeXlm} (${sim.estimatedFeeStroops} stroops). Review and sign to submit.`,
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error && error.message
+          ? error.message
+          : 'Unable to simulate claim transaction.';
+      setSorobanPhase('error');
+      setClaimState('error');
+      setTimelineFailure({ step: 'simulate', reason: message });
+      setStatusMessage(message);
+    } finally {
+      inFlightRef.current = false;
+    }
+  };
+
+  const handleSorobanSignAndSubmit = async () => {
+    if (!wallet || !wallet.address || !simulationInfo) {
+      return;
+    }
+
+    if (!isTestnetNetworkPassphrase(wallet.networkPassphrase)) {
+      const message = 'Signing refused: switch Freighter to Stellar Testnet to claim.';
+      setSorobanPhase('error');
+      setClaimState('error');
+      setTimelineFailure({ step: 'sign', reason: message });
+      setStatusMessage(message);
+      return;
+    }
+
+    inFlightRef.current = true;
+    setClaimState('pending');
+    setSorobanPhase('signing');
+    setTimelineFailure(null);
+    setPollAttempt(0);
+    setStatusMessage('Waiting for Freighter signature on Stellar Testnet…');
+
+    try {
+      const { signedTxXdr } = await signClaimTransaction(
+        simulationInfo.preparedTransaction,
+        wallet.networkPassphrase,
+        wallet.address,
+      );
+
+      setSorobanPhase('submitting');
+      setStatusMessage('Submitting signed transaction to Stellar Testnet…');
+
+      const handlePollStatus = (update: ClaimPollUpdate) => {
+        setTxHash(update.hash);
+        if (update.status === 'NOT_FOUND') {
+          setSorobanPhase('polling');
+          setPollAttempt(update.attempt ?? 1);
+          setStatusMessage('Transaction submitted. Waiting for ledger confirmation…');
+        } else if (update.status === 'SUCCESS') {
+          setSorobanPhase('confirmed');
+        } else if (update.status === 'FAILED') {
+          setSorobanPhase('error');
+        }
+      };
+
+      const submission = await submitAndPollClaimTransaction(signedTxXdr, {
+        onStatus: handlePollStatus,
+        pollIntervalMs,
+        maxAttempts: maxPollAttempts,
+      });
+
+      setTxHash(submission.hash);
+      setConfirmedAt(new Date().toLocaleString());
+      setSorobanPhase('confirmed');
+      setClaimState('confirmed');
+      setStatusMessage('Claim confirmed on Stellar Testnet.');
+    } catch (error) {
+      setSorobanPhase('error');
+      setClaimState('error');
+
+      if (error instanceof ClaimTransactionError) {
+        if (error.txHash) {
+          setTxHash(error.txHash);
+        }
+        const step: TimelineFailure['step'] =
+          error.code === 'NETWORK_MISMATCH' ||
+          error.code === 'USER_REJECTED' ||
+          error.code === 'SIGNING_FAILED' ||
+          (error.code === 'TIMEOUT' && !error.txHash)
+            ? 'sign'
+            : error.code === 'SUBMIT_FAILED'
+              ? 'submit'
+              : 'confirm';
+        setTimelineFailure({ step, reason: error.message });
+        setStatusMessage(error.message);
+      } else {
+        const message =
+          error instanceof Error && error.message
+            ? error.message
+            : 'Unable to complete claim transaction. Please try again.';
+        setTimelineFailure({ step: 'confirm', reason: message });
+        setStatusMessage(message);
+      }
+    } finally {
+      inFlightRef.current = false;
+    }
+  };
 
   const handleClaimNow = async () => {
     if (inFlightRef.current || claimState === 'pending') {
@@ -129,6 +411,15 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
     if (!unlockedAmount || unlockedAmount === '$0.00') {
       setClaimState('error');
       setStatusMessage('Nothing is currently available to claim.');
+      return;
+    }
+
+    if (useSorobanFlow) {
+      if (sorobanPhase === 'simulated' && simulationInfo) {
+        await handleSorobanSignAndSubmit();
+      } else {
+        await handleSorobanSimulate();
+      }
       return;
     }
 
@@ -173,13 +464,29 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
     }
     setHighGasConfirmed(false);
     setTxHash(null);
+    setSorobanPhase('idle');
+    setSimulationInfo(null);
+    setTimelineFailure(null);
     setClaimState('later');
     setStatusMessage('We will remind you again at a better time to claim this unlock.');
   };
 
   const isPending = claimState === 'pending';
   const gasLabel = gasEstimate >= 80 ? 'High' : gasEstimate >= 50 ? 'Moderate' : 'Low';
-  const explorerUrl = txHash ? `${explorerBaseUrl}${encodeURIComponent(txHash)}` : null;
+  const explorerUrl = txHash
+    ? useSorobanFlow
+      ? buildTransactionExplorerUrl(txHash)
+      : `${explorerBaseUrl}${encodeURIComponent(txHash)}`
+    : null;
+  const isSorobanDisabled = useSorobanFlow && (!isWalletConnected || isNetworkMismatch);
+
+  const primaryButtonLabel = useSorobanFlow
+    ? sorobanPhase === 'simulated'
+      ? 'Sign & submit'
+      : 'Claim now'
+    : claimState === 'warning'
+      ? 'Claim anyway'
+      : 'Claim now';
 
   return (
     <div
@@ -194,7 +501,7 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
         tabIndex={-1}
-        className="w-full max-w-lg rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl outline-none dark:border-slate-700 dark:bg-slate-900"
+        className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl outline-none dark:border-slate-700 dark:bg-slate-900"
         dir="auto"
         onClick={(event) => event.stopPropagation()}
       >
@@ -219,6 +526,29 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
           Your lockup has unlocked partially. Choose how you want to receive the available balance.
         </p>
 
+        {useSorobanFlow && !isWalletConnected && (
+          <div
+            role="alert"
+            className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800"
+          >
+            <AlertTriangle size={16} className="mt-0.5 shrink-0" aria-hidden="true" />
+            <span>Connect a Freighter wallet on Stellar Testnet to enable on-chain claiming.</span>
+          </div>
+        )}
+
+        {useSorobanFlow && isNetworkMismatch && (
+          <div
+            role="alert"
+            className="mt-4 flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700"
+          >
+            <AlertTriangle size={16} className="mt-0.5 shrink-0" aria-hidden="true" />
+            <span>
+              Signing refused: Freighter is connected to a mismatched network. Switch to Stellar
+              Testnet to claim.
+            </span>
+          </div>
+        )}
+
         <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-800/70">
           <div className="flex items-center justify-between">
             <div>
@@ -233,11 +563,30 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
           <div className="mt-4 flex items-center justify-between rounded-xl border border-slate-200 bg-white px-3 py-3 text-sm dark:border-slate-700 dark:bg-slate-900/80">
             <div>
               <p className="font-medium text-slate-700 dark:text-slate-200">Estimated gas</p>
-              <p className="text-slate-500 dark:text-slate-400">{gasLabel.toLowerCase()} network fee estimate</p>
+              <p className="text-slate-500 dark:text-slate-400">
+                {simulationInfo
+                  ? 'simulated Soroban testnet fee'
+                  : `${gasLabel.toLowerCase()} network fee estimate`}
+              </p>
             </div>
             <div className="text-right">
-              <p className="font-semibold text-slate-900 dark:text-white">{gasEstimate}%</p>
-              <p className="text-xs uppercase tracking-[0.2em] text-slate-500">~${Math.max(8, Math.round(gasEstimate * 1.2)).toFixed(0)} fee</p>
+              {simulationInfo ? (
+                <>
+                  <p className="font-semibold text-slate-900 dark:text-white">
+                    {simulationInfo.estimatedFeeXlm}
+                  </p>
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+                    {simulationInfo.estimatedFeeStroops} stroops
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="font-semibold text-slate-900 dark:text-white">{gasEstimate}%</p>
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+                    ~${Math.max(8, Math.round(gasEstimate * 1.2)).toFixed(0)} fee
+                  </p>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -282,6 +631,16 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
           </div>
         </div>
 
+        {useSorobanFlow && sorobanPhase !== 'idle' && (
+          <div className="mt-4">
+            <StatusTimeline
+              milestones={milestones}
+              orientation="horizontal"
+              ariaLabel="Claim transaction status"
+            />
+          </div>
+        )}
+
         {claimState === 'warning' && (
           <div role="alert" className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
             <AlertTriangle size={16} className="mt-0.5 shrink-0" aria-hidden="true" />
@@ -295,7 +654,8 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
           </div>
         )}
 
-        {claimState !== 'idle' && claimState !== 'warning' && claimState !== 'error' && (
+        {((claimState !== 'idle' && claimState !== 'warning' && claimState !== 'error') ||
+          (useSorobanFlow && sorobanPhase === 'simulated' && statusMessage)) && (
           <div role="status" className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700">
             <p>{statusMessage}</p>
             {txHash && explorerUrl && (
@@ -318,6 +678,22 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
           </div>
         )}
 
+        {useSorobanFlow && sorobanPhase === 'confirmed' && txHash && wallet?.address && (
+          <div className="mt-4">
+            <TransactionReceiptShare
+              transactionId={`claim-period-${periodId}`}
+              transactionHash={txHash}
+              explorerUrl={explorerUrl ?? undefined}
+              date={confirmedAt ?? new Date().toLocaleString()}
+              amount={unlockedAmount}
+              currency="USDC"
+              status="completed"
+              senderWallet={CONTRACT_ID}
+              recipientWallet={wallet.address}
+            />
+          </div>
+        )}
+
         <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-end">
           <Button
             type="button"
@@ -332,10 +708,10 @@ export const LockupClaimModal: React.FC<LockupClaimModalProps> = ({
             type="button"
             onClick={handleClaimNow}
             loading={isPending}
-            disabled={isPending}
+            disabled={isPending || isSorobanDisabled}
             className="w-full sm:w-auto"
           >
-            {claimState === 'warning' ? 'Claim anyway' : 'Claim now'}
+            {primaryButtonLabel}
             <ChevronRight size={16} className="ml-2 inline" aria-hidden="true" />
           </Button>
         </div>
